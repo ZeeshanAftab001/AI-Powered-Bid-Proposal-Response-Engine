@@ -9,8 +9,7 @@ app = FastAPI(
     description="Automated RFP/RFQ/Tender analysis and proposal generation",
     version="1.0.0"
 )
-#uv run python -m uvicorn app.main:app --reload
-
+#uv run python -m uvicorn main:app --reload
 # Enable CORS for frontend (React, etc.)
 app.add_middleware(
     CORSMiddleware,
@@ -22,3 +21,26 @@ app.add_middleware(
 
 app.include_router(rpdf_router)
 app.include_router(rag_router)
+
+
+@app.get("/")
+async def root():
+    return {
+        "message": "RFP Agent API",
+        "version": "2.0.0",
+        "endpoints": {
+            "process": "POST /api/process-file",
+            "workspace": "GET /api/workspace/{rfp_id}",
+            "workspaces": "GET /api/workspaces",
+            "delete": "DELETE /api/workspace/{rfp_id}"
+        }
+    }
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "service": "RFP Agent"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

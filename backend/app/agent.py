@@ -1,13 +1,19 @@
+"""
+Main LangGraph Agent - FULLY FIXED VERSION
+- No flat 75 scores
+- Workspace separation ready
+- Proper sector detection
+"""
+
 import os
 from typing import List, Optional, TypedDict, Dict, Any
 from pydantic import BaseModel, Field
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.memory import MemorySaver
 from langchain_google_genai import ChatGoogleGenerativeAI
-from app.rag import capability_rag
 from dotenv import load_dotenv
 
+# Import modules
 from app.feature_extractor import (
     extract_sector_from_text,
     parse_budget_amount,
@@ -19,13 +25,17 @@ from app.feature_extractor import (
     calculate_efficiency_score,
     calculate_pages_per_gap,
     calculate_compliance_budget_ratio,
-    encode_sector_to_numeric,
     create_feature_vector
 )
+from app.matcher import match_requirements
 from app.win_probability import WinProbabilityScorer
 from app.ml_predictor import get_ml_predictor
+from app.rag import capability_rag
+from app.workspace import WorkspaceManager
 
 load_dotenv()
+
+# ============== Pydantic Models ==============
 
 class ParsedRFP(BaseModel):
     deadline: Optional[str] = Field(description="RFP deadline date")
@@ -43,15 +53,10 @@ class MatchResults(BaseModel):
     matches: List[RequirementMatch] = Field(description="All requirement matches")
     average_score: float = Field(description="Average match score")
 
-class ProposalSection(BaseModel):
-    section_title: str = Field(description="Section title")
-    content: str = Field(description="Proposal content for this section")
-    mapped_requirements: List[str] = Field(description="Requirements addressed")
-
 class GeneratedProposal(BaseModel):
     executive_summary: str = Field(description="Executive summary")
     company_overview: str = Field(description="Company capabilities overview")
-    response_sections: List[ProposalSection] = Field(description="Detailed responses")
+    response_sections: List[Dict] = Field(description="Detailed responses")
     conclusion: str = Field(description="Conclusion")
 
 # ============== Initialize LLM ==============
@@ -64,7 +69,6 @@ except Exception as e:
     llm = None
 
 structured_llm_parser = llm.with_structured_output(ParsedRFP) if llm else None
-structured_llm_matcher = llm.with_structured_output(MatchResults) if llm else None
 structured_llm_proposal = llm.with_structured_output(GeneratedProposal) if llm else None
 
 # ============== Define State ==============
@@ -84,26 +88,39 @@ class RFPState(TypedDict):
     ml_features: Dict[str, Any]
     feature_vector: List[float]
     ml_prediction: Dict[str, Any]
+    workspace_id: str
 
 # ============== Node Functions ==============
 
 def parse_rfp(state: RFPState) -> RFPState:
+    """Parse RFP document with structured output"""
+    
     print("\n📄 Step 1: Parsing RFP document...")
     
     if not structured_llm_parser:
-        raise Exception("LLM not available")
+        # Fallback parsing
+        text = state.get("rfp_text", "")
+        state["deadline"] = "Not specified"
+        state["budget"] = "Not specified"
+        state["mandatory_requirements"] = []
+        state["evaluation_criteria"] = []
+        return state
     
     prompt = ChatPromptTemplate.from_template("""
-    Parse this RFP document and extract the required information.
+    You are an expert RFP Analyst. Parse the following RFP document and extract structured data.
     
-    RFP Text:
+    RFP TEXT:
     {text}
     
-    Extract:
-    - Deadline date
-    - Budget amount
-    - All mandatory requirements
-    - Evaluation criteria
+    INSTRUCTIONS:
+    1. DEADLINE: Look for 'Submission Deadline' or 'Due Date'. Extract the full date/time string.
+    2. BUDGET: Look for 'Budget Range' or 'Estimated Value'. Specifically look for PKR or USD amounts.
+    3. MANDATORY REQUIREMENTS: These are often in Section 2 or a table with headers like 'ID', 'Requirement', 'Evidence'.
+       - Look for IDs like M1, M2, M3...
+       - Extract every single requirement that is marked as 'Mandatory' or 'Non-compliance = automatic disqualification'.
+    4. EVALUATION CRITERIA: Look for Section 3 or 'Weightage' tables. Extract the main criteria names and weights.
+    
+    Return the data in the requested structured format.
     """)
     
     chain = prompt | structured_llm_parser
@@ -117,19 +134,24 @@ def parse_rfp(state: RFPState) -> RFPState:
         state["evaluation_criteria"] = result.evaluation_criteria
         
         print(f"   ✓ Found {len(result.mandatory_requirements)} mandatory requirements")
+        print(f"   ✓ Deadline: {state['deadline']}")
+        print(f"   ✓ Budget: {state['budget']}")
+        
         return state
     except Exception as e:
-        print(f"   ✗ Error: {e}")
-        state["mandatory_requirements"] = []
+        print(f"   ✗ Error parsing RFP: {e}")
         return state
 
 
 def retrieve_from_rag(state: RFPState) -> RFPState:
+    """Retrieve relevant capabilities from RAG for each requirement"""
+    
     print("\n🔍 Step 2: Retrieving capabilities from RAG...")
     
     requirements = state.get("mandatory_requirements", [])
     
     if not requirements:
+        print("   ✗ No requirements to retrieve")
         return state
     
     retrieved = {}
@@ -145,56 +167,34 @@ def retrieve_from_rag(state: RFPState) -> RFPState:
         all_capabilities.extend(caps)
     state["company_capabilities"] = list(set(all_capabilities))
     
+    print(f"\n   📚 Total unique capabilities retrieved: {len(state['company_capabilities'])}")
+    
     return state
 
 
-def match_requirements(state: RFPState) -> RFPState:
-    print("\n🎯 Step 3: Matching requirements...")
+def match_requirements_node(state: RFPState) -> RFPState:
+    """Match requirements using RAG capabilities - FIXED: no flat 75 scores"""
+    
+    print("\n🎯 Step 3: Matching requirements with RAG capabilities...")
     
     requirements = state.get("mandatory_requirements", [])
     retrieved_caps = state.get("retrieved_capabilities", {})
     
-    if not requirements:
-        state["match_results"] = {"matches": [], "average_score": 0}
-        return state
+    # Use the fixed matcher that calculates real scores
+    match_results = match_requirements(requirements, retrieved_caps)
     
-    matches = []
-    total_score = 0
+    state["match_results"] = match_results
     
-    for req in requirements[:10]:
-        caps = retrieved_caps.get(req, [])
-        if caps:
-            score = min(100, len(caps) * 25)
-            evidence = caps[:3]
-            reasoning = f"Found {len(caps)} matching capabilities"
-        else:
-            score = 0
-            evidence = []
-            reasoning = "No matching capabilities found"
-        
-        matches.append({
-            "requirement": req,
-            "score": score,
-            "evidence": evidence,
-            "reasoning": reasoning
-        })
-        total_score += score
+    print(f"\n   ✓ Average match score: {match_results['average_score']:.1f}%")
+    print(f"   ✓ Score distribution: {[m['score'] for m in match_results['matches'][:5]]}")
     
-    avg_score = total_score / len(matches) if matches else 0
-    
-    state["match_results"] = {
-        "matches": matches,
-        "average_score": avg_score
-    }
-    
-    print(f"   ✓ Average match score: {avg_score:.1f}%")
     return state
 
 
 def generate_ml_features(state: RFPState) -> RFPState:
-    """Generate all 13 ML features using utils"""
+    """Generate all 13 ML features - FIXED sector detection"""
     
-    print("\n📊 Step: Generating ML Features...")
+    print("\n📊 Step 4: Generating ML Features...")
     
     rfp_text = state.get("rfp_text", "")
     deadline = state.get("deadline", "Not specified")
@@ -203,7 +203,7 @@ def generate_ml_features(state: RFPState) -> RFPState:
     matches = match_results.get("matches", [])
     avg_match_score = match_results.get("average_score", 50.0)
     
-    # Extract features using utils
+    # Extract features using improved functions
     sector = extract_sector_from_text(rfp_text)
     budget = parse_budget_amount(budget_str)
     compliance = calculate_compliance_score(matches, state.get("mandatory_requirements", []))
@@ -239,14 +239,20 @@ def generate_ml_features(state: RFPState) -> RFPState:
     # Create feature vector
     state["feature_vector"] = create_feature_vector(state["ml_features"])
     
+    print(f"   ✓ Sector detected: {sector}")
+    print(f"   ✓ Budget: ${budget:,.0f}")
+    print(f"   ✓ Compliance: {compliance:.1f}%")
+    print(f"   ✓ Match Score: {score:.1f}%")
+    print(f"   ✓ Gaps Found: {gaps_found}")
     print(f"   ✓ All 13 ML features generated")
+    
     return state
 
 
 def predict_with_ml(state: RFPState) -> RFPState:
     """Make ML prediction using utils"""
     
-    print("\n🎯 Step: Running ML Prediction...")
+    print("\n🎯 Step 5: Running ML Prediction...")
     
     feature_vector = state.get("feature_vector", [])
     
@@ -262,12 +268,15 @@ def predict_with_ml(state: RFPState) -> RFPState:
     
     print(f"   ✓ Win Probability: {prediction['win_probability']*100:.1f}%")
     print(f"   ✓ Outcome: {prediction['outcome']}")
+    print(f"   ✓ Method: {prediction.get('method', 'unknown')}")
     
     return state
 
 
 def generate_proposal(state: RFPState) -> RFPState:
-    print("\n✍️ Step 4: Generating proposal...")
+    """Generate proposal using RAG-retrieved capabilities"""
+    
+    print("\n✍️ Step 6: Generating proposal...")
     
     requirements = state.get("mandatory_requirements", [])
     retrieved_caps = state.get("retrieved_capabilities", {})
@@ -279,7 +288,7 @@ def generate_proposal(state: RFPState) -> RFPState:
         if caps:
             content = "We have relevant experience:\n" + "\n".join([f"- {c}" for c in caps[:3]])
         else:
-            content = "We will develop the necessary capabilities."
+            content = "We will develop the necessary capabilities to meet this requirement."
         
         sections.append({
             "section_title": f"Response to: {req[:60]}",
@@ -288,10 +297,10 @@ def generate_proposal(state: RFPState) -> RFPState:
         })
     
     state["proposal"] = {
-        "executive_summary": f"We are responding with {len(requirements)} requirements addressed. Match score: {avg_score:.1f}%",
-        "company_overview": "Our company has demonstrated capabilities in relevant areas.",
+        "executive_summary": f"We are responding to this RFP with strong capabilities. Our overall match score is {avg_score:.1f}%, demonstrating our readiness.",
+        "company_overview": "Our company has demonstrated capabilities as documented in our capability database.",
         "response_sections": sections,
-        "conclusion": "We are confident in our ability to deliver."
+        "conclusion": "We are confident in our ability to deliver this project successfully."
     }
     
     print(f"   ✓ Generated proposal with {len(sections)} sections")
@@ -299,20 +308,29 @@ def generate_proposal(state: RFPState) -> RFPState:
 
 
 def calculate_win_score(state: RFPState) -> RFPState:
-    print("\n📊 Step: Calculating win score...")
+    """Calculate final win probability using comprehensive scorer"""
+    
+    print("\n📊 Step 7: Calculating win score...")
     
     scorer = WinProbabilityScorer(verbose=True)
+    
+    match_scores = {}
+    for m in state.get("match_results", {}).get("matches", []):
+        match_scores[m["requirement"]] = m["score"]
     
     win_analysis = scorer.calculate(
         rfp_text=state.get("rfp_text", ""),
         requirements=state.get("mandatory_requirements", []),
         matched_capabilities=state.get("retrieved_capabilities", {}),
-        match_scores={m["requirement"]: m["score"] for m in state.get("match_results", {}).get("matches", [])}
+        match_scores=match_scores
     )
     
     state["final_score"] = win_analysis["total_score"]
     state["recommendation"] = win_analysis["recommendation"]
     state["win_analysis"] = win_analysis
+    
+    print(f"   ✓ Final Win Score: {win_analysis['total_score']:.1f}/100")
+    print(f"   ✓ Recommendation: {win_analysis['recommendation']}")
     
     return state
 
@@ -320,16 +338,20 @@ def calculate_win_score(state: RFPState) -> RFPState:
 # ============== Create Workflow ==============
 
 def create_rfp_workflow():
+    """Create LangGraph workflow with all nodes"""
+    
     workflow = StateGraph(RFPState)
     
+    # Add nodes
     workflow.add_node("parse_rfp", parse_rfp)
     workflow.add_node("retrieve_from_rag", retrieve_from_rag)
-    workflow.add_node("match_requirements", match_requirements)
+    workflow.add_node("match_requirements", match_requirements_node)
     workflow.add_node("generate_ml_features", generate_ml_features)
     workflow.add_node("predict_with_ml", predict_with_ml)
     workflow.add_node("generate_proposal", generate_proposal)
     workflow.add_node("calculate_win_score", calculate_win_score)
     
+    # Add edges
     workflow.set_entry_point("parse_rfp")
     workflow.add_edge("parse_rfp", "retrieve_from_rag")
     workflow.add_edge("retrieve_from_rag", "match_requirements")
@@ -339,10 +361,13 @@ def create_rfp_workflow():
     workflow.add_edge("generate_proposal", "calculate_win_score")
     workflow.add_edge("calculate_win_score", END)
     
-    memory = MemorySaver()
-    return workflow.compile(checkpointer=memory)
+    return workflow.compile(checkpointer=WorkspaceManager.get_memory_saver())
 
 
 # Create agent instance
 agent = create_rfp_workflow()
-print("\n✅ RFP Agent initialized with utils!")
+print("\n✅ RFP Agent initialized successfully!")
+print("   - RAG integration: Active")
+print("   - Fixed: Real match scores (no flat 75)")
+print("   - Fixed: Better sector detection")
+print("   - Workspace separation: Ready")
